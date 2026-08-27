@@ -3,7 +3,7 @@ name: Torrent Download & Smart Upload to Filemirage (rtorrent)
 on:
   push:
     branches:
-      - '*'
+      - main
   workflow_dispatch:
 
 jobs:
