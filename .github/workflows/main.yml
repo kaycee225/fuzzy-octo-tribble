@@ -18,11 +18,13 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo npm install -g pnpm
-          sudo pnpm setup
-          sudo pnpm add -g webtorrent-cli
-          echo "/root/.local/share/pnpm" >> $GITHUB_PATH
-          echo "/root/.local/share/pnpm/bin" >> $GITHUB_PATH
+          corepack enable
+          corepack prepare pnpm@latest --activate
+          export PNPM_HOME="$HOME/.local/share/pnpm"
+          mkdir -p "$PNPM_HOME"
+          echo "$PNPM_HOME" >> $GITHUB_PATH
+          pnpm config set global-bin-dir "$PNPM_HOME"
+          pnpm add -g webtorrent-cli
           pip3 install requests
 
       - name: Download, Zip Conditions & Upload
