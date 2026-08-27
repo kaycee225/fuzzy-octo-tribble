@@ -18,7 +18,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo npm install -g webtorrent-cli
+          sudo npm install -g --ignore-scripts webtorrent-cli
           pip3 install requests
 
       - name: Download, Zip Conditions & Upload
