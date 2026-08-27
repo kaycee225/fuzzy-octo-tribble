@@ -1,4 +1,4 @@
-name: Torrent Download & Smart Upload to Filemirage (webtorrent)
+name: Torrent Download & Smart Upload to Filemirage (rtorrent)
 
 on:
   push:
@@ -18,6 +18,8 @@ jobs:
 
       - name: Install dependencies
         run: |
+          sudo apt-get update
+          sudo apt-get install -y rtorrent tmux
           pip3 install requests
 
       - name: Download, Zip Conditions & Upload
@@ -27,11 +29,13 @@ jobs:
           import re
           import sys
           import time
+          import socket
           import shutil
           import zipfile
           import tempfile
           import subprocess
           import urllib.request
+          import xml.etree.ElementTree as ET
           import requests
 
           PAGE_URL = "https://equestria-eta.vercel.app/api/pages/dprjjMvC8fCF/raw"
@@ -74,36 +78,133 @@ jobs:
                   combined = "bundle"
               return os.path.join(temp_dir, f"{combined}.zip")
 
+          # --- rTorrent SCGI XML-RPC Helpers ---
+          def scgi_call(method_name, *args):
+              params_xml = "".join([f"<param><value><string>{a}</string></value></param>" for a in args])
+              xml_payload = f"<?xml version=\"1.0\"?><methodCall><methodName>{method_name}</methodName><params>{params_xml}</params></methodCall>"
+              
+              headers = f"CONTENT_LENGTH\x00{len(xml_payload)}\x00SCGI\x001\x00".encode('utf-8')
+              header_len = f"{len(headers)}:".encode('utf-8')
+              body = header_len + headers + b',' + xml_payload.encode('utf-8')
+              
+              s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              s.connect(('127.0.0.1', 5000))
+              s.sendall(body)
+              
+              resp = b""
+              while True:
+                  chunk = s.recv(4096)
+                  if not chunk:
+                      break
+                  resp += chunk
+              s.close()
+              
+              header_end = resp.find(b"\r\n\r\n")
+              if header_end != -1:
+                  xml_data = resp[header_end+4:]
+              else:
+                  header_end = resp.find(b"\n\n")
+                  xml_data = resp[header_end+2:] if header_end != -1 else resp
+                  
+              return xml_data.decode('utf-8', errors='ignore')
+
+          def parse_xml_list(xml_str):
+              try:
+                  root = ET.fromstring(xml_str)
+                  return [node.text for node in root.findall(".//value/string") if node.text]
+              except Exception:
+                  return []
+
+          def parse_xml_int(xml_str):
+              try:
+                  root = ET.fromstring(xml_str)
+                  val_node = root.find(".//value/i4") or root.find(".//value/int")
+                  if val_node is not None and val_node.text:
+                      return int(val_node.text)
+              except Exception:
+                  pass
+              return 0
+
+          def parse_xml_str(xml_str):
+              try:
+                  root = ET.fromstring(xml_str)
+                  val_node = root.find(".//value/string")
+                  if val_node is not None and val_node.text:
+                      return val_node.text
+              except Exception:
+                  pass
+              return ""
+
           def main():
-              # 1. Create temporary directory
+              # 1. Create temporary directory & rtorrent config
               temp_dir = tempfile.mkdtemp(prefix="torrent_download_")
+              session_dir = tempfile.mkdtemp(prefix="rtorrent_session_")
               print(f"Downloading files to temporary folder: {temp_dir}")
 
-              # 2. Fetch magnet links
-              print("Fetching magnet links...")
-              req = urllib.request.Request(PAGE_URL, headers={"User-Agent": "Mozilla/5.0"})
+              rc_content = f"""
+directory.default.set = {temp_dir}
+session.path.set = {session_dir}
+network.scgi.open_port = 127.0.0.1:5000
+"""
+              rc_path = os.path.expanduser("~/.rtorrent.rc")
+              with open(rc_path, "w") as f:
+                  f.write(rc_content)
+
+              # Start rtorrent daemon in headless tmux session
+              print("Starting rTorrent daemon...")
+              subprocess.run(["tmux", "new-session", "-d", "-s", "rtorrent_daemon", "rtorrent"])
+              time.sleep(3)
+
               try:
-                  with urllib.request.urlopen(req) as response:
-                      lines = response.read().decode("utf-8").splitlines()
-              except Exception as e:
-                  print(f"Failed to fetch page: {e}")
-                  sys.exit(1)
+                  # 2. Fetch magnet links
+                  print("Fetching magnet links...")
+                  req = urllib.request.Request(PAGE_URL, headers={"User-Agent": "Mozilla/5.0"})
+                  try:
+                      with urllib.request.urlopen(req) as response:
+                          lines = response.read().decode("utf-8").splitlines()
+                  except Exception as e:
+                      print(f"Failed to fetch page: {e}")
+                      sys.exit(1)
 
-              links = [line.strip() for line in lines if line.strip() and not line.startswith("#")]
-              if not links:
-                  print("No magnet links found.")
-                  return
+                  links = [line.strip() for line in lines if line.strip() and not line.startswith("#")]
+                  if not links:
+                      print("No magnet links found.")
+                      return
 
-              # 3. Download torrents using npx webtorrent-cli
-              print(f"Downloading {len(links)} magnet link(s) via npx webtorrent-cli...")
-              for i, link in enumerate(links, start=1):
-                  print(f"\n--- Starting download [{i}/{len(links)}] ---")
-                  cmd = ["npx", "--yes", "webtorrent-cli", "download", link, "-o", temp_dir]
-                  res = subprocess.run(cmd)
-                  if res.returncode != 0:
-                      print(f"Warning: webtorrent exited with non-zero status for link #{i}")
+                  # 3. Add magnet links to rtorrent
+                  print(f"Adding {len(links)} magnet link(s) to rTorrent...")
+                  for i, link in enumerate(links, start=1):
+                      print(f" -> Adding magnet #{i}")
+                      scgi_call("load.start", "", link)
 
-              print("\nAll downloads completed!")
+                  # Poll download progress until complete
+                  print("\nWaiting for torrent downloads to finish...")
+                  while True:
+                      hashes = parse_xml_list(scgi_call("download_list"))
+                      if hashes:
+                          completed = True
+                          for h in hashes:
+                              is_done = parse_xml_int(scgi_call("d.complete", h))
+                              name = parse_xml_str(scgi_call("d.name", h)) or h[:8]
+                              bytes_done = parse_xml_int(scgi_call("d.completed_bytes", h))
+                              total_bytes = parse_xml_int(scgi_call("d.size_bytes", h))
+                              pct = (bytes_done / total_bytes * 100) if total_bytes > 0 else 0
+                              
+                              print(f"  [{name}] {pct:.1f}% ({bytes_done}/{total_bytes} bytes)")
+                              if is_done != 1:
+                                  completed = False
+                          
+                          if completed:
+                              print("\nAll torrent downloads completed!")
+                              break
+                      else:
+                          print("  Waiting for torrent metadata...")
+
+                      time.sleep(10)
+
+              finally:
+                  # Stop rtorrent session cleanly
+                  subprocess.run(["tmux", "kill-session", "-t", "rtorrent_daemon"], stderr=subprocess.DEVNULL)
 
               final_upload_files = []
 
