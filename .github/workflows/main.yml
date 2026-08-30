@@ -1,346 +1,190 @@
-name: Torrent Download & Smart Upload to Filemirage (rtorrent)
+name: Torrent Download & Smart Upload to Pixeldrain (Libtorrent Optimized)
 
 on:
   push:
     branches:
-      - '*'
+      - main
   workflow_dispatch:
 
 jobs:
   torrent-upload:
     runs-on: ubuntu-latest
     env:
-      FILEMIRAGE_API_TOKEN: '9QQH-DGES-CWQZ-FXNV'
-
+      PIXELDRAIN_API_KEY: '1890d8a2-9099-4484-8238-fe667dbfd6bd'
+      FOLDER_PATH: 'downloaded_files'
+      PAGE_URL: 'https://pink-script-snap.lovable.app/api/public/page/ce6c23ca-89a3-4ce6-afdd-1f13ea0655a5.txt'
+      
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y rtorrent tmux
-          pip3 install requests
+          sudo apt update && sudo apt install python3-libtorrent jq curl -y
 
-      - name: Download, Zip Conditions & Upload
+      - name: Supercharged Libtorrent Download
         run: |
           python3 - << 'EOF'
-          import os
-          import re
-          import sys
+          import libtorrent as lt
           import time
-          import socket
-          import shutil
-          import zipfile
-          import tempfile
-          import subprocess
           import urllib.request
-          import xml.etree.ElementTree as ET
-          import requests
+          import os
+          import shutil
 
-          PAGE_URL = "https://equestria-eta.vercel.app/api/pages/dprjjMvC8fCF/raw"
-          FILEMIRAGE_TOKEN = os.environ.get("FILEMIRAGE_API_TOKEN", "")
+          # --- ADVANCED TUNING FOR LOW SEEDS ---
+          # We configure the session to be extremely aggressive in finding peers
+          # and very patient with slow/weak connections.
+          settings = {
+              'listen_interfaces': '0.0.0.0:6881',
+              'enable_dht': True,
+              'enable_pex': True,
+              'enable_lsd': True,
+              'connections_limit': 1000,
+              'peer_timeout': 240,       # Wait up to 4 mins before dropping a dead peer
+              'inactivity_timeout': 600, # Allow peers to idle longer if they are slow
+              'request_timeout': 30,     # Give slow peers more time to send blocks
+              'auto_manage_prefer_seeds': True,
+              'strict_end_game_mode': False
+          }
+          ses = lt.session(settings)
+          
+          save_path = os.environ.get('FOLDER_PATH', 'downloaded_files')
+          os.makedirs(save_path, exist_ok=True)
+          
+          url = os.environ.get('PAGE_URL')
+          added_links = set()
+          handles = []
+          
+          # 1. Fetch live trackers to inject into magnets for immediate peering
+          print("🌐 Fetching live tracker list to boost low-seed discovery...")
+          try:
+              req = urllib.request.Request("https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt", headers={'User-Agent': 'Mozilla/5.0'})
+              with urllib.request.urlopen(req) as response:
+                  trackers = [t for t in response.read().decode('utf-8').split('\n') if t.strip()]
+              print(f"✅ Loaded {len(trackers)} live trackers.")
+          except Exception as e:
+              print("⚠️ Could not load trackers, falling back to DHT.")
+              trackers = []
 
-          # Extensions ignored when calculating file thresholds (>5, >3)
-          IGNORED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.txt', '.nfo'}
+          print("🚀 Starting Libtorrent engine & dynamic fetcher...")
 
-          def is_counted_file(filepath):
-              ext = os.path.splitext(filepath)[1].lower()
-              return ext not in IGNORED_EXTENSIONS
-
-          def zip_directory(dir_path, zip_output_path):
-              with zipfile.ZipFile(zip_output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                  for root, _, files in os.walk(dir_path):
-                      for file in files:
-                          full_path = os.path.join(root, file)
-                          arcname = os.path.relpath(full_path, dir_path)
-                          zipf.write(full_path, arcname)
-
-          def zip_files(file_paths, zip_output_path):
-              with zipfile.ZipFile(zip_output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                  for fpath in file_paths:
-                      zipf.write(fpath, os.path.basename(fpath))
-
-          def get_concise_zip_name(show_titles, temp_dir, max_len=55):
-              clean_titles = []
-              for t in show_titles:
-                  c = re.sub(r'[^a-zA-Z0-9]+', '_', t).strip('_')
-                  if c and c not in clean_titles:
-                      clean_titles.append(c)
-              
-              combined = "_".join(clean_titles)
-              if len(combined) > max_len:
-                  if len(clean_titles) > 1:
-                      combined = f"{clean_titles[0][:25]}_and_{len(clean_titles)-1}_more"
-                  else:
-                      combined = clean_titles[0][:max_len]
-              if not combined:
-                  combined = "bundle"
-              return os.path.join(temp_dir, f"{combined}.zip")
-
-          # --- rTorrent SCGI XML-RPC Helpers ---
-          def scgi_call(method_name, *args):
-              params_xml = "".join([f"<param><value><string>{a}</string></value></param>" for a in args])
-              xml_payload = f"<?xml version=\"1.0\"?><methodCall><methodName>{method_name}</methodName><params>{params_xml}</params></methodCall>"
-              
-              headers = f"CONTENT_LENGTH\x00{len(xml_payload)}\x00SCGI\x001\x00".encode('utf-8')
-              header_len = f"{len(headers)}:".encode('utf-8')
-              body = header_len + headers + b',' + xml_payload.encode('utf-8')
-              
-              s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-              s.connect(('127.0.0.1', 5000))
-              s.sendall(body)
-              
-              resp = b""
-              while True:
-                  chunk = s.recv(4096)
-                  if not chunk:
-                      break
-                  resp += chunk
-              s.close()
-              
-              header_end = resp.find(b"\r\n\r\n")
-              if header_end != -1:
-                  xml_data = resp[header_end+4:]
-              else:
-                  header_end = resp.find(b"\n\n")
-                  xml_data = resp[header_end+2:] if header_end != -1 else resp
-                  
-              return xml_data.decode('utf-8', errors='ignore')
-
-          def parse_xml_list(xml_str):
+          while True:
+              # 2. Fetch Control Page
               try:
-                  root = ET.fromstring(xml_str)
-                  return [node.text for node in root.findall(".//value/string") if node.text]
-              except Exception:
-                  return []
-
-          def parse_xml_int(xml_str):
-              try:
-                  root = ET.fromstring(xml_str)
-                  val_node = root.find(".//value/i4") or root.find(".//value/int")
-                  if val_node is not None and val_node.text:
-                      return int(val_node.text)
-              except Exception:
-                  pass
-              return 0
-
-          def parse_xml_str(xml_str):
-              try:
-                  root = ET.fromstring(xml_str)
-                  val_node = root.find(".//value/string")
-                  if val_node is not None and val_node.text:
-                      return val_node.text
-              except Exception:
-                  pass
-              return ""
-
-          def main():
-              # 1. Create temporary directory & rtorrent config
-              temp_dir = tempfile.mkdtemp(prefix="torrent_download_")
-              session_dir = tempfile.mkdtemp(prefix="rtorrent_session_")
-              print(f"Downloading files to temporary folder: {temp_dir}")
-
-              rc_content = (
-                  f"directory.default.set = {temp_dir}\n"
-                  f"session.path.set = {session_dir}\n"
-                  f"network.scgi.open_port = 127.0.0.1:5000\n"
-              )
-              rc_path = os.path.expanduser("~/.rtorrent.rc")
-              with open(rc_path, "w") as f:
-                  f.write(rc_content)
-
-              # Start rtorrent daemon in headless tmux session
-              print("Starting rTorrent daemon...")
-              subprocess.run(["tmux", "new-session", "-d", "-s", "rtorrent_daemon", "rtorrent"])
-              time.sleep(3)
-
-              try:
-                  # 2. Fetch magnet links
-                  print("Fetching magnet links...")
-                  req = urllib.request.Request(PAGE_URL, headers={"User-Agent": "Mozilla/5.0"})
-                  try:
-                      with urllib.request.urlopen(req) as response:
-                          lines = response.read().decode("utf-8").splitlines()
-                  except Exception as e:
-                      print(f"Failed to fetch page: {e}")
-                      sys.exit(1)
-
-                  links = [line.strip() for line in lines if line.strip() and not line.startswith("#")]
-                  if not links:
-                      print("No magnet links found.")
-                      return
-
-                  # 3. Add magnet links to rtorrent
-                  print(f"Adding {len(links)} magnet link(s) to rTorrent...")
-                  for i, link in enumerate(links, start=1):
-                      print(f" -> Adding magnet #{i}")
-                      scgi_call("load.start", "", link)
-
-                  # Poll download progress until complete
-                  print("\nWaiting for torrent downloads to finish...")
-                  while True:
-                      hashes = parse_xml_list(scgi_call("download_list"))
-                      if hashes:
-                          completed = True
-                          for h in hashes:
-                              is_done = parse_xml_int(scgi_call("d.complete", h))
-                              name = parse_xml_str(scgi_call("d.name", h)) or h[:8]
-                              bytes_done = parse_xml_int(scgi_call("d.completed_bytes", h))
-                              total_bytes = parse_xml_int(scgi_call("d.size_bytes", h))
-                              pct = (bytes_done / total_bytes * 100) if total_bytes > 0 else 0
-                              
-                              print(f"  [{name}] {pct:.1f}% ({bytes_done}/{total_bytes} bytes)")
-                              if is_done != 1:
-                                  completed = False
-                          
-                          if completed:
-                              print("\nAll torrent downloads completed!")
-                              break
-                      else:
-                          print("  Waiting for torrent metadata...")
-
-                      time.sleep(10)
-
-              finally:
-                  # Stop rtorrent session cleanly
-                  subprocess.run(["tmux", "kill-session", "-t", "rtorrent_daemon"], stderr=subprocess.DEVNULL)
-
-              final_upload_files = []
-
-              # Step 4A: Check subdirectories for > 5 counted files
-              for item in os.listdir(temp_dir):
-                  full_path = os.path.join(temp_dir, item)
-                  if os.path.isdir(full_path):
-                      dir_files = []
-                      for root, _, files in os.walk(full_path):
-                          for f in files:
-                              dir_files.append(os.path.join(root, f))
-
-                      counted_files = [f for f in dir_files if is_counted_file(f)]
-                      if len(counted_files) > 5:
-                          zip_name = os.path.join(temp_dir, f"{item}.zip")
-                          print(f"Subfolder '{item}' has {len(counted_files)} counted files (>5). Zipping into '{item}.zip'...")
-                          zip_directory(full_path, zip_name)
-                          final_upload_files.append(zip_name)
-                          shutil.rmtree(full_path)
-
-              # Step 4B: Scan remaining files
-              remaining_files = []
-              for root, _, files in os.walk(temp_dir):
-                  for f in files:
-                      fpath = os.path.join(root, f)
-                      if fpath not in final_upload_files:
-                          remaining_files.append(fpath)
-
-              # Step 4C: Detect series patterns
-              series_regex = re.compile(r'^(.*?)[._\s-]+(?:[sS]\d+|\d+[xX]\d+|season\s*\d+|ep?\d+)', re.IGNORECASE)
-              series_groups = {}
-              non_series_files = []
-
-              for fpath in remaining_files:
-                  fname = os.path.basename(fpath)
-                  match = series_regex.match(fname)
-                  if match:
-                      show_title = re.sub(r'[._-]+', ' ', match.group(1)).strip().lower()
-                      if show_title not in series_groups:
-                          series_groups[show_title] = []
-                      series_groups[show_title].append(fpath)
-                  else:
-                      non_series_files.append(fpath)
-
-              # Step 4D: Process Series groups
-              small_series_files = []
-              small_series_titles = []
-
-              for show_title, files in series_groups.items():
-                  counted_in_group = [f for f in files if is_counted_file(f)]
-                  if len(counted_in_group) > 3:
-                      files.sort()
-                      zip_name = get_concise_zip_name([show_title], temp_dir)
-                      print(f"Series '{show_title}' has {len(counted_in_group)} counted file(s) (>3). Zipping into '{os.path.basename(zip_name)}'...")
-                      zip_files(files, zip_name)
-                      final_upload_files.append(zip_name)
-                      for f in files:
-                          if os.path.exists(f): os.remove(f)
-                  else:
-                      print(f"Series '{show_title}' has {len(counted_in_group)} counted file(s) (<=3). Collecting for potential zip bundle...")
-                      small_series_files.extend(files)
-                      small_series_titles.append(show_title)
-
-              # Zip small series files ONLY if total counted files across small series is strictly > 3
-              counted_small_files = [f for f in small_series_files if is_counted_file(f)]
-              if len(counted_small_files) > 3:
-                  bundle_zip_name = get_concise_zip_name(small_series_titles, temp_dir)
-                  print(f"Zipping {len(small_series_files)} small series file(s) ({len(counted_small_files)} counted files >3 total) together into '{os.path.basename(bundle_zip_name)}'...")
-                  zip_files(small_series_files, bundle_zip_name)
-                  final_upload_files.append(bundle_zip_name)
-                  for f in small_series_files:
-                      if os.path.exists(f): os.remove(f)
-              elif small_series_files:
-                  print(f"Only {len(counted_small_files)} counted small series file(s) (<=3 total). Skipping zip, uploading as unzipped files.")
-                  final_upload_files.extend(small_series_files)
-
-              # Process Non-Series files (uploaded normally unzipped)
-              final_upload_files.extend(non_series_files)
-
-              # 5. Fetch Filemirage server and upload items via Python requests
-              print("\nFetching Filemirage server...")
-              try:
-                  srv_resp = requests.get("https://filemirage.com/api/servers", timeout=15).json()
-                  server = srv_resp.get("data", {}).get("server")
+                  req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                  with urllib.request.urlopen(req) as response:
+                      lines = [l.strip() for l in response.read().decode('utf-8').split('\n') if l.strip()]
               except Exception as e:
-                  print(f"Error connecting to Filemirage API: {e}")
-                  sys.exit(1)
+                  print(f"⚠️ Failed to fetch page: {e}")
+                  lines = []
+                  
+              lines_lower = [l.lower() for l in lines]
+              
+              # 3. Global Kill Switch
+              if "STOP.ALL.TORRENTS" in lines:
+                  print("🛑 Global kill switch 'STOP.ALL.TORRENTS' detected! Halting.")
+                  break
+                  
+              # 4. Add New Magnets & Inject Trackers
+              for line in lines:
+                  if line.startswith("magnet:") and line not in added_links:
+                      print(f"📥 New magnet link detected! Adding to session...")
+                      params = lt.parse_magnet_uri(line)
+                      params.save_path = save_path
+                      
+                      # Inject the live trackers directly into the torrent
+                      for tr in trackers:
+                          params.trackers.append(tr)
+                          
+                      handle = ses.add_torrent(params)
+                      handles.append(handle)
+                      added_links.add(line)
+                      
+              # 5. Process Status & Specific Kill Switches
+              all_done = True if handles else False
+              active_handles = []
+              state_str = ['queued', 'checking', 'downloading metadata', 'downloading', 'finished', 'seeding', 'allocating', 'checking fastresume']
+              
+              for h in handles:
+                  s = h.status()
+                  name = s.name if s.name else "Resolving Metadata..."
+                  
+                  # Specific Kill Switch
+                  if name != "Resolving Metadata...":
+                      if f"{name.lower()} no" in lines_lower or f"no {name.lower()}" in lines_lower:
+                          print(f"🛑 Specific stop triggered for '{name}'. Removing files...")
+                          ses.remove_torrent(h)
+                          
+                          target_path = os.path.join(save_path, name)
+                          if os.path.exists(target_path):
+                              if os.path.isdir(target_path): shutil.rmtree(target_path)
+                              else: os.remove(target_path)
+                          continue
+                          
+                  active_handles.append(h)
+                  
+                  if s.progress >= 1.0:
+                      h.pause() # Stop seeding when 100% to save CI time
+                  else:
+                      all_done = False
+                      
+                  # Report Progress with Peer count
+                  if name != "Resolving Metadata...":
+                      current_state = state_str[int(s.state)] if int(s.state) < len(state_str) else str(s.state)
+                      print(f"📥 {name} | Prog: {s.progress * 100:.1f}% | Peers: {s.num_peers} | Seeds: {s.num_seeds} | {current_state}")
+                  else:
+                      print("📥 Resolving magnet metadata... (Finding peers)")
+                      
+              handles = active_handles
+              
+              if handles and all_done:
+                  print("✅ All active downloads completed naturally!")
+                  break
+                  
+              time.sleep(10)
 
-              if not server:
-                  print("Failed to get valid Filemirage server.")
-                  sys.exit(1)
-
-              headers = {"Authorization": f"Bearer {FILEMIRAGE_TOKEN}"}
-              print(f"\nUploading {len(final_upload_files)} item(s) to Filemirage server ({server})...")
-
-              has_failed = False
-              for file_path in final_upload_files:
-                  if not os.path.isfile(file_path):
-                      continue
-                  file_name = os.path.basename(file_path)
-                  print(f"Uploading: {file_name}")
-
-                  try:
-                      with open(file_path, "rb") as f:
-                          res = requests.post(
-                              f"{server.rstrip('/')}/upload.php",
-                              headers=headers,
-                              files={"file": (file_name, f)},
-                              timeout=300
-                          )
-
-                      if res.status_code == 200:
-                          try:
-                              res_json = res.json()
-                              if res_json.get("success"):
-                                  print(f" -> Uploaded: {file_name}")
-                              else:
-                                  print(f" -> Failed: {file_name} | API error: {res.text}")
-                                  has_failed = True
-                          except Exception:
-                              if '"success":true' in res.text.lower():
-                                  print(f" -> Uploaded: {file_name}")
-                              else:
-                                  print(f" -> Failed: {file_name} | Non-JSON Response: {res.text}")
-                                  has_failed = True
-                      else:
-                          print(f" -> Failed: {file_name} | HTTP Status: {res.status_code} | {res.text}")
-                          has_failed = True
-
-                  except Exception as e:
-                      print(f" -> Error uploading {file_name}: {e}")
-                      has_failed = True
-
-              if has_failed:
-                  sys.exit(1)
-
-          if __name__ == "__main__":
-              main()
+          # Final cleanup for incomplete files if Global Kill Switch was hit
+          for h in handles:
+              if h.status().progress < 1.0:
+                  name = h.status().name if h.status().name else "Unknown"
+                  print(f"❌ Removing incomplete global download: {name}")
+                  ses.remove_torrent(h)
+                  if name != "Unknown":
+                      target_path = os.path.join(save_path, name)
+                      if os.path.exists(target_path):
+                          if os.path.isdir(target_path): shutil.rmtree(target_path)
+                          else: os.remove(target_path)
           EOF
+
+      - name: Upload files to Pixeldrain
+        run: |
+          find "$FOLDER_PATH" -type f | sort | while read -r FILE; do
+              if [[ "$FILE" == *".!qB"* || "$FILE" == *".part"* ]]; then
+                  continue
+              fi
+
+              FILENAME=$(basename "$FILE")
+              
+              FILE_SIZE_BYTES=$(stat -c%s "$FILE")
+              FILE_SIZE_MB=$(awk "BEGIN {printf \"%.2f\", $FILE_SIZE_BYTES/1024/1024}")
+              
+              echo "Uploading: $FILE ($FILE_SIZE_MB MB)"
+              
+              # Upload via Pixeldrain API with basic auth using the API key
+              RESPONSE=$(curl -s -u ":$PIXELDRAIN_API_KEY" -T "$FILE" "https://pixeldrain.com/api/file/")
+              
+              if echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
+                  success=$(echo "$RESPONSE" | jq -r '.success')
+                  if [ "$success" != "true" ]; then
+                      echo "❌ Failed to upload $FILENAME: $(echo "$RESPONSE" | jq -r '.message')"
+                  else
+                      FILE_ID=$(echo "$RESPONSE" | jq -r '.id')
+                      echo "✅ Successfully uploaded: $FILENAME"
+                      echo "🔗 Download Link: https://pixeldrain.com/u/$FILE_ID"
+                  fi
+              else
+                  echo "❌ Server returned an invalid response (not JSON)."
+                  echo "Raw Server Response:"
+                  echo "$RESPONSE"
+              fi
+          done
